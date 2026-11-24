@@ -4,8 +4,9 @@ const FREE_START = 5;              // пробные запросы
 const FRESH_MS = 14 * 86400000;    // записи старше 14 дней не выдаём
 const COOLDOWN_MS = 10_000;        // пауза между "Взять человека"
 const DAILY_LIMIT = 25;            // людей в сутки на пользователя
-const REWARD = 10_000_000;         // награда за принятую пару: 0.01 TON
+const REWARD = 250_000_000;        // награда за принятую пару: 0.25 TON
 const EARN_DAILY = 30;             // принятых пар в сутки на человека
+const OFFER_URL = 'https://t.me/garisofferopenbot'; // куда ведёт кнопка "Сделать оффер"
 const DEFAULT_CHANNELS = ['prodazhai', 'prodazhaq', 'prodazhah', 'mospodbor', 'chatik_podarkov1', 'NFT_chatkk', 'podarkov_chatNFT', 'nft_chat_prodazha', 'prodazha_nft_chat', 'chattik_nft', 'podarkov_chatkk'];
 
 const ton = n => +(n / 1e9).toFixed(3);
@@ -378,7 +379,7 @@ async function onCallback(q, env) {
   await tg(env, 'editMessageText', { chat_id: chat, message_id: mid,
     text: `🎁 NFT: https://t.me/nft/${nft.slug}\n👤 ${nft.verified ? 'Владелец' : 'Продавец'}: @${nft.owner}\n\nОсталось: ${admin ? '∞' : u2.free} беспл. | ${ton(u2.balance)} TON${today}`,
     reply_markup: { inline_keyboard: [
-      [{ text: '💼 Сделать оффер', url: env.OFFER_URL }],
+      [{ text: '💼 Сделать оффер', url: OFFER_URL }],
       [{ text: '👤 Взять ещё', callback_data: 'get' }],
     ] } });
 }
