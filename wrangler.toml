@@ -1,0 +1,16 @@
+name = "gggarisbot"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+ADMIN_ID = "5151757168"
+WALLET = "UQChRfzub4CLp2FAV998bfowFC4eE3aqIRQQeZinoajQ0oOG"
+OFFER_URL = "https://t.me/garisofferopen"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gggaris-db"
+database_id = "ВСТАВЬ_СЮДА_ID_БАЗЫ"
+
+[triggers]
+crons = ["* * * * *"]
