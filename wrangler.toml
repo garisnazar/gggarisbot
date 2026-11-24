@@ -10,7 +10,7 @@ OFFER_URL = "https://t.me/garisofferopen"
 [[d1_databases]]
 binding = "DB"
 database_name = "gggaris-db"
-database_id = "ВСТАВЬ_СЮДА_ID_БАЗЫ"
+database_id = "e438e80a-1b0e-4a37-a7e9-155b0f36220e"
 
 [triggers]
 crons = ["* * * * *"]
