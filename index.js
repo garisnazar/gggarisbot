@@ -1,9 +1,14 @@
 const PRICE = 100_000_000;         // 0.1 TON в nanoTON
 const MIN_DEPOSIT = 1_000_000_000; // 1 TON
 const FREE_START = 5;              // пробные запросы
+const FRESH_MS = 14 * 86400000;    // записи старше 14 дней не выдаём
+const COOLDOWN_MS = 10_000;        // пауза между "Взять человека"
+const DAILY_LIMIT = 25;            // людей в сутки на пользователя
+const DEFAULT_CHANNELS = ['prodazhai', 'prodazhaq', 'prodazhah', 'mospodbor', 'chatik_podarkov1', 'NFT_chatkk', 'podarkov_chatNFT', 'nft_chat_prodazha', 'prodazha_nft_chat', 'chattik_nft', 'podarkov_chatkk'];
 
 const ton = n => +(n / 1e9).toFixed(3);
 const isAdmin = (env, id) => String(id) === String(env.ADMIN_ID);
+const dayKey = () => new Date(Date.now() + 3 * 3600e3).toISOString().slice(0, 10); // сутки по Москве
 
 let ready = false;
 async function initDb(db) {
@@ -11,9 +16,14 @@ async function initDb(db) {
   await db.batch([
     db.prepare('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, free INTEGER NOT NULL DEFAULT 5, balance INTEGER NOT NULL DEFAULT 0, created_at INTEGER)'),
     db.prepare('CREATE TABLE IF NOT EXISTS payments (hash TEXT PRIMARY KEY, user_id INTEGER, amount INTEGER, comment TEXT, created_at INTEGER)'),
-    db.prepare('CREATE TABLE IF NOT EXISTS nfts (slug TEXT PRIMARY KEY, owner TEXT, name TEXT, added_at INTEGER)'),
-    db.prepare('CREATE TABLE IF NOT EXISTS seen (user_id INTEGER, slug TEXT, PRIMARY KEY (user_id, slug))'),
+    db.prepare('CREATE TABLE IF NOT EXISTS items (slug TEXT PRIMARY KEY, owner TEXT, name TEXT, verified INTEGER, added_at INTEGER)'),
+    db.prepare('CREATE TABLE IF NOT EXISTS seen2 (user_id INTEGER, owner TEXT, PRIMARY KEY (user_id, owner))'),
+    db.prepare('CREATE TABLE IF NOT EXISTS channels (name TEXT PRIMARY KEY)'),
+    db.prepare('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY)'),
+    db.prepare('CREATE TABLE IF NOT EXISTS usage2 (user_id INTEGER PRIMARY KEY, day TEXT, cnt INTEGER NOT NULL DEFAULT 0, last_ts INTEGER NOT NULL DEFAULT 0)'),
   ]);
+  const s = await db.prepare("INSERT OR IGNORE INTO meta (k) VALUES ('seed2')").run();
+  if (s.meta.changes) await db.batch(DEFAULT_CHANNELS.map(n => db.prepare('INSERT OR IGNORE INTO channels (name) VALUES (?)').bind(n)));
   ready = true;
 }
 
@@ -45,76 +55,102 @@ async function refund(env, id, kind) {
   if (kind === 'paid') await env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(PRICE, id).run();
 }
 
-// ---------- страница NFT: имя владельца ----------
-const H_PLAIN = { 'user-agent': 'Mozilla/5.0' };
+// задержка 10 сек + лимит 25/сутки; возвращает текст отказа или null
+async function gate(env, id, admin) {
+  if (admin) return null;
+  const now = Date.now(), day = dayKey();
+  await env.DB.prepare('INSERT OR IGNORE INTO usage2 (user_id,day,cnt,last_ts) VALUES (?,?,0,0)').bind(id, day).run();
+  await env.DB.prepare('UPDATE usage2 SET day=?, cnt=0 WHERE user_id=? AND day<>?').bind(day, id, day).run();
+  const u = await env.DB.prepare('SELECT cnt,last_ts FROM usage2 WHERE user_id=?').bind(id).first();
+  if (u.cnt >= DAILY_LIMIT) return `📅 Дневной лимит: ${DAILY_LIMIT} человек. Новый день начнётся в 00:00 по Москве.`;
+  const r = await env.DB.prepare('UPDATE usage2 SET last_ts=? WHERE user_id=? AND last_ts<=?').bind(now, id, now - COOLDOWN_MS).run();
+  if (!r.meta.changes) return `⏳ Подожди ещё ${Math.max(1, Math.ceil((u.last_ts + COOLDOWN_MS - now) / 1000))} сек.`;
+  return null;
+}
+
+// ---------- вспомогательное ----------
 const H_FULL = {
   'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
   'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'accept-language': 'en-US,en;q=0.9',
 };
-const OWNER_RE = />\s*Owner\s*<\/th>\s*<td[^>]*>([\s\S]*?)<\/td>/i;
-
 const decode = s => s
   .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(+n))
   .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
   .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-const norm = s => decode(s).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-function sameName(page, first, last) {
-  const a = norm(page), b = norm(`${first || ''}${last || ''}`);
-  if (!a || !b) return false;
-  return a === b || (a.length > 3 && b.includes(a)) || (b.length > 3 && a.includes(b));
-}
 
-// имя владельца со страницы t.me/nft/<slug>; null — страница не получена (Telegram иногда отдаёт заглушку)
-async function pageOwner(slug) {
-  const pages = await Promise.all([H_PLAIN, H_PLAIN, H_FULL].map(h =>
-    fetch(`https://t.me/nft/${slug}`, { headers: h }).then(r => r.text()).catch(() => '')));
-  for (const html of pages) {
-    const m = html.match(OWNER_RE);
-    if (m) return decode(m[1].replace(/<[^>]+>/g, '')).trim();
+// ---------- сканирование публичных каналов (t.me/s/<канал>) ----------
+const SKIP_NAMES = new Set(['nft', 'mrkt', 'portals', 'tonnel', 'share', 'addlist', 'joinchat', 'boost', 'proxy', 'socks', 'login', 'telegram', 'durov', 'username', 'iv']);
+
+async function scanChannel(env, name) {
+  const r = await fetch(`https://t.me/s/${name}`, { headers: H_FULL });
+  if (!r.ok) return { name, posts: 0, withNft: 0, added: 0, err: `HTTP ${r.status}` };
+  const html = await r.text();
+  const chunks = html.split('tgme_widget_message_wrap').slice(1);
+  const stmts = [];
+  let withNft = 0;
+  for (const ch of chunks) {
+    const t = Date.parse((ch.match(/datetime="([^"]+)"/) || [])[1] || '');
+    if (!t || t < Date.now() - FRESH_MS) continue;
+    const slugs = [...new Set([...ch.matchAll(/t\.me\/nft\/([A-Za-z0-9_]+-\d+)/gi)].map(x => x[1]))].slice(0, 5);
+    if (!slugs.length) continue;
+    withNft++;
+    const text = decode(ch.replace(/<[^>]+>/g, ' ')).replace(/(через|via)\s+@\w+/gi, ' ');
+    const cands = [...text.matchAll(/@([A-Za-z][A-Za-z0-9_]{4,31})/g)].map(x => x[1]);
+    for (const x of ch.matchAll(/href="https?:\/\/t\.me\/([A-Za-z][A-Za-z0-9_]{4,31})"/g)) cands.push(x[1]);
+    const owner = cands.find(u => u.toLowerCase() !== name.toLowerCase() && !/bot$/i.test(u) && !SKIP_NAMES.has(u.toLowerCase()));
+    if (!owner) continue;
+    for (const slug of slugs)
+      stmts.push(env.DB.prepare('INSERT OR IGNORE INTO items (slug,owner,name,verified,added_at) VALUES (?,?,?,0,?)').bind(slug, owner, '', t));
   }
-  return null;
-}
-async function verify(slug, u) {
-  const page = await pageOwner(slug);
-  if (page === null) return null;
-  return sameName(page, u.first_name, u.last_name);
+  let added = 0;
+  for (let i = 0; i < stmts.length; i += 50) {
+    const res = await env.DB.batch(stmts.slice(i, i + 50));
+    added += res.reduce((s, x) => s + (x.meta.changes || 0), 0);
+  }
+  return { name, posts: chunks.length, withNft, added };
 }
 
-// ---------- сбор NFT из чатов ----------
-async function collect(m, env, u) {
-  if (!u || u.is_bot || !u.username) return 0;
+async function scanSome(env, all = false) {
+  const { results } = await env.DB.prepare('SELECT name FROM channels ORDER BY name').all();
+  const names = results.map(r => r.name);
+  if (!names.length) return [];
+  const step = Math.floor(Date.now() / 60000) * 2;
+  const pick = all ? names : [0, 1].map(i => names[(step + i) % names.length]);
+  const out = [];
+  for (const n of [...new Set(pick)]) {
+    try { out.push(await scanChannel(env, n)); }
+    catch (e) { out.push({ name: n, posts: 0, withNft: 0, added: 0, err: String(e) }); }
+  }
+  return out;
+}
+const fmtScan = o => `@${o.name}: ${o.err ? 'ошибка ' + o.err : o.posts ? `постов ${o.posts}, с NFT ${o.withNft}, новых людей ${o.added}` : 'посты не видны (это чат — добавь в него бота)'}`;
+
+// ---------- сбор из чатов, где есть бот ----------
+async function collect(m, env, u, rep) {
+  const log = t => rep && rep.push(t);
+  if (!u || u.is_bot) return 0;
+  if (!u.username) { log(`У автора «${u.first_name}» нет публичного @юзернейма.`); return 0; }
   const urls = [...(m.entities || []), ...(m.caption_entities || [])].map(e => e.url || '').join(' ');
   const blob = `${m.text || ''} ${m.caption || ''} ${urls}`;
   const slugs = [...new Set([...blob.matchAll(/t\.me\/nft\/([A-Za-z0-9_]+-\d+)/gi)].map(x => x[1]))].slice(0, 5);
-  let added = 0;
-  for (const slug of slugs) {
-    const ex = await env.DB.prepare('SELECT owner FROM nfts WHERE slug=?').bind(slug).first();
-    if (ex && ex.owner === u.username) continue;
-    if ((await verify(slug, u)) !== true) continue; // имя владельца на странице не совпало
-    const name = `${u.first_name || ''} ${u.last_name || ''}`.trim();
-    await env.DB.prepare('INSERT OR REPLACE INTO nfts (slug,owner,name,added_at) VALUES (?,?,?,?)')
-      .bind(slug, u.username, name, Date.now()).run();
-    added++;
-  }
+  if (!slugs.length) { log('В сообщении нет ссылки t.me/nft/…'); return 0; }
+  const name = `${u.first_name || ''} ${u.last_name || ''}`.trim();
+  const res = await env.DB.batch(slugs.map(slug =>
+    env.DB.prepare('INSERT OR IGNORE INTO items (slug,owner,name,verified,added_at) VALUES (?,?,?,0,?)').bind(slug, u.username, name, Date.now())));
+  const added = res.reduce((s, x) => s + (x.meta.changes || 0), 0);
+  log(`@${u.username}: ссылок ${slugs.length}, новых ${added}`);
   return added;
 }
 
-// случайный владелец, которого этот пользователь ещё не получал
+// случайный человек, которого этот пользователь ещё не получал
 async function pickNft(env, userId) {
-  for (let i = 0; i < 4; i++) {
-    const row = await env.DB.prepare(
-      'SELECT * FROM nfts WHERE slug NOT IN (SELECT slug FROM seen WHERE user_id=?) ORDER BY RANDOM() LIMIT 1').bind(userId).first();
-    if (!row) return null;
-    const page = await pageOwner(row.slug);
-    if (page !== null && !sameName(page, row.name, '')) { // NFT сменил владельца
-      await env.DB.prepare('DELETE FROM nfts WHERE slug=?').bind(row.slug).run();
-      continue;
-    }
-    await env.DB.prepare('INSERT OR IGNORE INTO seen (user_id,slug) VALUES (?,?)').bind(userId, row.slug).run();
-    return row;
-  }
-  return null;
+  const row = await env.DB.prepare(
+    'SELECT * FROM items WHERE added_at > ? AND owner NOT IN (SELECT owner FROM seen2 WHERE user_id=?) ORDER BY RANDOM() LIMIT 1')
+    .bind(Date.now() - FRESH_MS, userId).first();
+  if (!row) return null;
+  await env.DB.prepare('INSERT OR IGNORE INTO seen2 (user_id,owner) VALUES (?,?)').bind(userId, row.owner).run();
+  return row;
 }
 
 // ---------- тексты ----------
@@ -123,30 +159,57 @@ const mainKb = { inline_keyboard: [
   [{ text: '💰 Баланс / Пополнить', callback_data: 'bal' }],
 ] };
 const mainText = (u, admin) =>
-  `👋 Бот-парсер NFT-подарков\n\n🎁 Бесплатных запросов: ${admin ? '∞' : u.free}\n💰 Баланс: ${ton(u.balance)} TON\n\nКаждый следующий запрос — 0.1 TON.`;
+  `👋 Бот-парсер NFT-подарков\n\n🎁 Бесплатных запросов: ${admin ? '∞' : u.free}\n💰 Баланс: ${ton(u.balance)} TON\n\nКаждый следующий запрос — 0.1 TON.\nПауза между запросами 10 сек, не больше ${DAILY_LIMIT} человек в сутки.`;
 const depositText = (env, u) =>
   `💰 Баланс: ${ton(u.balance)} TON\n\nПополнение (от 1 TON). Отправь TON на адрес:\n<code>${env.WALLET}</code>\n\n⚠️ В комментарии обязательно укажи свой ID:\n<code>${u.id}</code>\n\nЗачислится автоматически за 1–2 минуты.`;
 
 // ---------- обработчики ----------
 async function onMessage(m, env) {
-  if (m.chat.type !== 'private') { await collect(m, env, m.from); return; } // чаты: собираем ссылки
+  if (m.chat.type !== 'private') { if (!m.forward_origin) await collect(m, env, m.from); return; } // чаты: собираем ссылки
 
   const admin = isAdmin(env, m.from.id);
-  const [cmd, a, b] = (m.text || '').trim().split(/\s+/);
+  const parts = (m.text || '').trim().split(/\s+/);
+  const [cmd, a, b] = parts;
   const user = await getUser(env, m.from);
 
-  if (admin && m.forward_origin?.type === 'user') { // пересланное сообщение из чата продаж
-    const n = await collect(m, env, m.forward_origin.sender_user);
-    return send(env, m.chat.id, n ? `✅ Добавлено в базу: ${n}` : 'Не добавлено: нет ссылки на NFT, нет юзернейма у автора или имя владельца на странице не совпало.');
+  if (admin && m.forward_origin) { // пересланное сообщение из чата продаж
+    const o = m.forward_origin;
+    if (o.type === 'hidden_user') return send(env, m.chat.id, '❌ Автор скрыл пересылку — юзернейм взять негде.');
+    if (o.type !== 'user') return send(env, m.chat.id, '❌ Переслано из канала, автор неизвестен. Для каналов используй /addchannel имя.');
+    const rep = [];
+    const n = await collect(m, env, o.sender_user, rep);
+    return send(env, m.chat.id, `${n ? '✅ Добавлено: ' + n : '❌ Не добавлено'}\n${rep.join('\n')}`.slice(0, 3900));
+  }
+  if (admin && cmd === '/addchannel') { // /addchannel prodazhai  (можно несколько через пробел или ссылки)
+    const names = parts.slice(1).map(x => x.replace(/^.*t\.me\/(s\/)?/i, '').replace(/^@/, '').split(/[/?]/)[0]).filter(Boolean);
+    if (!names.length) return send(env, m.chat.id, 'Формат: /addchannel prodazhai (имя или ссылка, можно несколько)');
+    const lines = [];
+    for (const name of names.slice(0, 10)) {
+      if (!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(name)) { lines.push(`❌ ${name}: неверное имя`); continue; }
+      await env.DB.prepare('INSERT OR IGNORE INTO channels (name) VALUES (?)').bind(name).run();
+      const o = await scanChannel(env, name).catch(e => ({ name, err: String(e) }));
+      lines.push(fmtScan(o));
+    }
+    return send(env, m.chat.id, '✅ Добавлено в список\n' + lines.join('\n'));
+  }
+  if (admin && cmd === '/delchannel') {
+    await env.DB.prepare('DELETE FROM channels WHERE name=?').bind((a || '').replace(/^@/, '')).run();
+    return send(env, m.chat.id, '✅ Удалено (если был в списке).');
+  }
+  if (admin && cmd === '/channels') {
+    const { results } = await env.DB.prepare('SELECT name FROM channels ORDER BY name').all();
+    return send(env, m.chat.id, `📡 Источники (${results.length}):\n` + results.map(r => '@' + r.name).join('\n'));
+  }
+  if (admin && cmd === '/scan') { // сканировать все каналы прямо сейчас
+    const out = await scanSome(env, true);
+    return send(env, m.chat.id, (out.length ? out.map(fmtScan).join('\n') : 'Список пуст: /addchannel имя').slice(0, 3900));
   }
   if (admin && cmd === '/stats') {
-    const c = await env.DB.prepare('SELECT COUNT(*) AS c FROM nfts').first();
+    const all = await env.DB.prepare('SELECT COUNT(*) AS c FROM items').first();
+    const own = await env.DB.prepare('SELECT COUNT(DISTINCT owner) AS c FROM items').first();
     const u = await env.DB.prepare('SELECT COUNT(*) AS c FROM users').first();
-    return send(env, m.chat.id, `📊 NFT в базе: ${c.c}\n👥 Пользователей: ${u.c}`);
-  }
-  if (admin && cmd === '/nft') { // проверка страницы: /nft PlushPepe-1
-    const n = await pageOwner(a || 'PlushPepe-1');
-    return send(env, m.chat.id, `Владелец на странице: ${n ?? 'не получено (заглушка Telegram или NFT нет)'}`);
+    const ch = await env.DB.prepare('SELECT COUNT(*) AS c FROM channels').first();
+    return send(env, m.chat.id, `📊 NFT в базе: ${all.c}, людей: ${own.c}\n📡 Источников: ${ch.c}\n👥 Пользователей: ${u.c}`);
   }
   if (admin && cmd === '/addzapros') {
     const n = parseInt(a), id = parseInt(b);
@@ -170,6 +233,11 @@ async function onMessage(m, env) {
 async function onCallback(q, env) {
   const chat = q.message.chat.id;
   const admin = isAdmin(env, q.from.id);
+
+  if (q.data === 'get') {
+    const block = await gate(env, q.from.id, admin);
+    if (block) return tg(env, 'answerCallbackQuery', { callback_query_id: q.id, text: block, show_alert: true });
+  }
   await tg(env, 'answerCallbackQuery', { callback_query_id: q.id });
   const user = await getUser(env, q.from);
 
@@ -180,6 +248,7 @@ async function onCallback(q, env) {
 
   const kind = await charge(env, q.from.id, admin);
   if (!kind) {
+    await env.DB.prepare('UPDATE usage2 SET last_ts=0 WHERE user_id=?').bind(q.from.id).run();
     return send(env, chat, '❌ Бесплатные запросы закончились, а на балансе меньше 0.1 TON.\n\n' + depositText(env, user), { parse_mode: 'HTML' });
   }
   const wait = await send(env, chat, '🔎 Ищу...');
@@ -188,13 +257,20 @@ async function onCallback(q, env) {
 
   if (!nft) {
     await refund(env, q.from.id, kind);
+    await env.DB.prepare('UPDATE usage2 SET last_ts=0 WHERE user_id=?').bind(q.from.id).run();
     return tg(env, 'editMessageText', { chat_id: chat, message_id: mid,
-      text: '😕 Новых владельцев пока нет, база пополняется. Запрос не списан — попробуй позже.',
+      text: '😕 Новых людей пока нет, база пополняется. Запрос не списан — попробуй позже.',
       reply_markup: { inline_keyboard: [[{ text: '🔁 Ещё раз', callback_data: 'get' }]] } });
+  }
+  let today = '';
+  if (!admin) {
+    await env.DB.prepare('UPDATE usage2 SET cnt=cnt+1 WHERE user_id=?').bind(q.from.id).run();
+    const us = await env.DB.prepare('SELECT cnt FROM usage2 WHERE user_id=?').bind(q.from.id).first();
+    today = ` | сегодня ${us.cnt}/${DAILY_LIMIT}`;
   }
   const u2 = await env.DB.prepare('SELECT * FROM users WHERE id=?').bind(q.from.id).first();
   await tg(env, 'editMessageText', { chat_id: chat, message_id: mid,
-    text: `🎁 NFT: https://t.me/nft/${nft.slug}\n👤 Владелец: @${nft.owner}\n\nОсталось: ${admin ? '∞' : u2.free} беспл. | ${ton(u2.balance)} TON`,
+    text: `🎁 NFT: https://t.me/nft/${nft.slug}\n👤 Продавец: @${nft.owner}\n\nОсталось: ${admin ? '∞' : u2.free} беспл. | ${ton(u2.balance)} TON${today}`,
     reply_markup: { inline_keyboard: [
       [{ text: '💼 Сделать оффер', url: env.OFFER_URL }],
       [{ text: '👤 Взять ещё', callback_data: 'get' }],
@@ -246,6 +322,10 @@ export default {
     return new Response('ok');
   },
   async scheduled(event, env, ctx) {
-    ctx.waitUntil((async () => { await initDb(env.DB); await checkPayments(env); })().catch(e => console.error(e)));
+    ctx.waitUntil((async () => {
+      await initDb(env.DB);
+      await checkPayments(env).catch(e => console.error(e));
+      await scanSome(env).catch(e => console.error(e));
+    })());
   },
 };
