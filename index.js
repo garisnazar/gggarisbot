@@ -105,15 +105,17 @@ async function onMessage(m, env) {
     await send(env, m.chat.id, `✅ Зачислено ${t} TON → ${id}`);
     return send(env, id, `✅ Баланс пополнен на ${t} TON`);
   }
-  if (admin && cmd === '/nft') { // проверка парсера: /nft PlushPepe-1
+  if (admin && cmd === '/nft') { // отладка парсера: /nft PlushPepe-1
     const slug = a || 'PlushPepe-1';
     const r = await fetch(`https://t.me/nft/${slug}`, { headers: { 'user-agent': 'Mozilla/5.0' } });
     const html = await r.text();
     const res = parseOwner(html, slug);
-    const i = html.search(/Owner/i);
-    const snip = i >= 0 ? html.slice(Math.max(0, i - 100), i + 500) : '—';
-    const links = [...html.matchAll(/(?:t\.me\/|domain=)([A-Za-z0-9_]+)/g)].slice(0, 8).map(x => x[0]).join(', ');
-    return send(env, m.chat.id, `HTTP ${r.status}\nРезультат: ${res ? '@' + res.owner : 'не найден'}\nСсылки: ${links}\n\n${snip}`);
+    const title = (html.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || '—';
+    const plain = html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const g = html.search(/tgme_gift/i);
+    const raw = g >= 0 ? html.slice(g, g + 900) : html.slice(0, 600);
+    return send(env, m.chat.id,
+      `HTTP ${r.status}, ${html.length} симв.\nОтвет: ${res ? '@' + res.owner : 'не найден'}\nTitle: ${title}\n\nТЕКСТ: ${plain.slice(0, 700)}\n\nHTML: ${raw}`.slice(0, 3900));
   }
   if (cmd === '/start') return send(env, m.chat.id, mainText(user, admin), { reply_markup: mainKb });
 }
