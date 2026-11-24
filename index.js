@@ -47,9 +47,9 @@ async function refund(env, id, kind) {
 
 // ---------- поиск NFT (открытая страница t.me/nft/<Коллекция>-<номер>) ----------
 function parseOwner(html, slug) {
-  const m = html.match(/<th[^>]*>\s*Owner\s*<\/th>\s*<td[^>]*>([\s\S]*?)<\/td>/i);
+  const m = html.match(/>\s*Owner\s*<\/th>\s*<td[^>]*>([\s\S]*?)<\/td>/i);
   if (!m) return null;
-  const u = m[1].match(/href="(?:https?:\/\/t\.me\/|\/|tg:\/\/resolve\?domain=)@?([A-Za-z][A-Za-z0-9_]{3,31})"/i);
+  const u = m[1].match(/(?:t\.me\/|domain=|href="\/)@?([A-Za-z][A-Za-z0-9_]{3,31})/i);
   if (!u) return null; // у владельца нет юзернейма
   return { link: `https://t.me/nft/${slug}`, owner: u[1] };
 }
@@ -110,12 +110,10 @@ async function onMessage(m, env) {
     const r = await fetch(`https://t.me/nft/${slug}`, { headers: { 'user-agent': 'Mozilla/5.0' } });
     const html = await r.text();
     const res = parseOwner(html, slug);
-    const title = (html.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || '—';
-    const plain = html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-    const g = html.search(/tgme_gift/i);
-    const raw = g >= 0 ? html.slice(g, g + 900) : html.slice(0, 600);
+    const o = html.search(/>\s*Owner\s*</i);
+    const raw = o >= 0 ? html.slice(Math.max(0, o - 100), o + 600) : 'Owner в HTML не найден';
     return send(env, m.chat.id,
-      `HTTP ${r.status}, ${html.length} симв.\nОтвет: ${res ? '@' + res.owner : 'не найден'}\nTitle: ${title}\n\nТЕКСТ: ${plain.slice(0, 700)}\n\nHTML: ${raw}`.slice(0, 3900));
+      `HTTP ${r.status}, ${html.length} симв.\nОтвет: ${res ? '@' + res.owner : 'не найден'}\n\nHTML у Owner:\n${raw}`.slice(0, 3900));
   }
   if (cmd === '/start') return send(env, m.chat.id, mainText(user, admin), { reply_markup: mainKb });
 }
