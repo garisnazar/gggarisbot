@@ -110,7 +110,10 @@ async function onMessage(m, env) {
     const r = await fetch(`https://t.me/nft/${slug}`, { headers: { 'user-agent': 'Mozilla/5.0' } });
     const html = await r.text();
     const res = parseOwner(html, slug);
-    return send(env, m.chat.id, `HTTP ${r.status}, html ${html.length} симв., есть "Owner": ${/Owner/i.test(html)}\nРезультат: ${res ? '@' + res.owner : 'не найден'}`);
+    const i = html.search(/Owner/i);
+    const snip = i >= 0 ? html.slice(Math.max(0, i - 100), i + 500) : '—';
+    const links = [...html.matchAll(/(?:t\.me\/|domain=)([A-Za-z0-9_]+)/g)].slice(0, 8).map(x => x[0]).join(', ');
+    return send(env, m.chat.id, `HTTP ${r.status}\nРезультат: ${res ? '@' + res.owner : 'не найден'}\nСсылки: ${links}\n\n${snip}`);
   }
   if (cmd === '/start') return send(env, m.chat.id, mainText(user, admin), { reply_markup: mainKb });
 }
