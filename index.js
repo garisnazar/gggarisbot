@@ -46,8 +46,16 @@ async function refund(env, id, kind) {
 }
 
 // ---------- поиск NFT (открытая страница t.me/nft/<Коллекция>-<номер>) ----------
+const HEADERS_PLAIN = { 'user-agent': 'Mozilla/5.0' };
+const HEADERS_FULL = {
+  'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'accept-language': 'en-US,en;q=0.9',
+};
+const OWNER_RE = />\s*Owner\s*<\/th>\s*<td[^>]*>([\s\S]*?)<\/td>/i;
+
 function parseOwner(html, slug) {
-  const m = html.match(/>\s*Owner\s*<\/th>\s*<td[^>]*>([\s\S]*?)<\/td>/i);
+  const m = html.match(OWNER_RE);
   if (!m) return null;
   const u = m[1].match(/(?:t\.me\/|domain=|href="\/)@?([A-Za-z][A-Za-z0-9_]{3,31})/i);
   if (!u) return null; // у владельца нет юзернейма
@@ -55,7 +63,7 @@ function parseOwner(html, slug) {
 }
 async function fetchNft(slug) {
   try {
-    const r = await fetch(`https://t.me/nft/${slug}`, { headers: { 'user-agent': 'Mozilla/5.0' } });
+    const r = await fetch(`https://t.me/nft/${slug}`, { headers: HEADERS_FULL });
     if (!r.ok) return null;
     return parseOwner(await r.text(), slug);
   } catch { return null; }
@@ -107,13 +115,22 @@ async function onMessage(m, env) {
   }
   if (admin && cmd === '/nft') { // отладка парсера: /nft PlushPepe-1
     const slug = a || 'PlushPepe-1';
-    const r = await fetch(`https://t.me/nft/${slug}`, { headers: { 'user-agent': 'Mozilla/5.0' } });
-    const html = await r.text();
-    const res = parseOwner(html, slug);
-    const o = html.search(/>\s*Owner\s*</i);
-    const raw = o >= 0 ? html.slice(Math.max(0, o - 100), o + 600) : 'Owner в HTML не найден';
-    return send(env, m.chat.id,
-      `HTTP ${r.status}, ${html.length} симв.\nОтвет: ${res ? '@' + res.owner : 'не найден'}\n\nHTML у Owner:\n${raw}`.slice(0, 3900));
+    const sets = [['A', HEADERS_PLAIN], ['A', HEADERS_PLAIN], ['A', HEADERS_PLAIN], ['B', HEADERS_FULL], ['B', HEADERS_FULL], ['B', HEADERS_FULL]];
+    const tries = await Promise.all(sets.map(async ([name, h], i) => {
+      try {
+        const r = await fetch(`https://t.me/nft/${slug}`, { headers: h });
+        const html = await r.text();
+        return { name: name + (i % 3 + 1), status: r.status, html, res: parseOwner(html, slug) };
+      } catch (e) { return { name: name + (i % 3 + 1), status: 'ERR ' + e, html: '', res: null }; }
+    }));
+    const lines = tries.map(t => `${t.name}: HTTP ${t.status}, ${t.html.length} симв., Owner=${OWNER_RE.test(t.html)}, ответ=${t.res ? '@' + t.res.owner : '—'}`);
+    const good = tries.find(t => OWNER_RE.test(t.html) || />\s*Owner\s*</i.test(t.html));
+    let raw = 'Страница с Owner не пришла ни разу';
+    if (good) {
+      const o = good.html.search(/>\s*Owner\s*</i);
+      raw = good.html.slice(Math.max(0, o - 100), o + 600);
+    }
+    return send(env, m.chat.id, `${slug}\n${lines.join('\n')}\n\nHTML у Owner:\n${raw}`.slice(0, 3900));
   }
   if (cmd === '/start') return send(env, m.chat.id, mainText(user, admin), { reply_markup: mainKb });
 }
