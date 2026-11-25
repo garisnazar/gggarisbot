@@ -144,38 +144,40 @@ function parsePairs(text, max) {
   return pairs.filter(([s]) => !seen.has(s.toLowerCase()) && seen.add(s.toLowerCase())).slice(0, max);
 }
 
-// ---------- сдача пар: админ добавляет сразу, остальные — с проверкой и наградой ----------
-async function handleSubmit(m, env, admin) {
-  const pairs = parsePairs(m.text || '', admin ? 30 : 5);
+// ---------- сдача пар: direct (админ) — сразу в базу; иначе проверка, дубли и награда ----------
+async function handleSubmit(m, env, direct, text) {
+  const pairs = parsePairs(text, direct ? 30 : 5);
   if (!pairs.length) return send(env, m.chat.id, '❌ Не нашёл пару «ссылка на NFT + @юзернейм». Пример:\nhttps://t.me/nft/PlushPepe-1 @username');
-  let left = admin ? 999 : await earnLeft(env, m.from.id);
+  let left = direct ? 999 : await earnLeft(env, m.from.id);
   if (left <= 0) return send(env, m.chat.id, `📅 Лимит на сегодня исчерпан (${EARN_DAILY} принятых пар). Продолжишь после 00:00 по Москве.`);
 
   const lines = [];
   let ok = 0;
   for (const [slug, owner] of pairs) {
-    if (admin) {
+    if (direct) {
       await env.DB.prepare('INSERT OR REPLACE INTO items (slug,owner,name,verified,added_at) VALUES (?,?,?,1,?)').bind(slug, owner, '', Date.now()).run();
       lines.push(`✅ ${slug} → @${owner}`); ok++; continue;
     }
     if (left <= 0) { lines.push(`⏸ ${slug}: дневной лимит`); continue; }
     if (/bot$/i.test(owner)) { lines.push(`❌ ${slug}: @${owner} — это бот`); continue; }
-    const ex = await env.DB.prepare('SELECT 1 AS x FROM items WHERE slug=?').bind(slug).first();
-    if (ex) { lines.push(`❌ ${slug}: такой NFT уже в базе`); continue; }
+    const dupN = await env.DB.prepare('SELECT 1 AS x FROM items WHERE lower(slug)=lower(?)').bind(slug).first();
+    if (dupN) { lines.push(`❌ ${slug}: этот NFT уже был добавлен ранее — не засчитано`); continue; }
+    const dupO = await env.DB.prepare('SELECT 1 AS x FROM items WHERE lower(owner)=lower(?)').bind(owner).first();
+    if (dupO) { lines.push(`❌ ${slug}: @${owner} уже есть в базе — не засчитано`); continue; }
     const page = await pageOwner(slug);
     if (page === null) { lines.push(`❌ ${slug}: страница NFT не загрузилась (проверь ссылку или повтори через минуту)`); continue; }
     const prof = await profileName(owner);
     if (!prof) { lines.push(`❌ ${slug}: @${owner} не найден`); continue; }
     if (!sameName(page, prof, '')) { lines.push(`❌ ${slug}: владелец на странице NFT «${page}», а у @${owner} имя «${prof}» — не совпало`); continue; }
     const ins = await env.DB.prepare('INSERT OR IGNORE INTO items (slug,owner,name,verified,added_at) VALUES (?,?,?,1,?)').bind(slug, owner, prof, Date.now()).run();
-    if (!ins.meta.changes) { lines.push(`❌ ${slug}: такой NFT уже в базе`); continue; }
+    if (!ins.meta.changes) { lines.push(`❌ ${slug}: этот NFT уже был добавлен ранее — не засчитано`); continue; }
     await env.DB.prepare('UPDATE users SET balance=balance+? WHERE id=?').bind(REWARD, m.from.id).run();
     await env.DB.prepare('UPDATE earn2 SET cnt=cnt+1 WHERE user_id=?').bind(m.from.id).run();
     left--; ok++;
     lines.push(`✅ ${slug} → @${owner} (+${ton(REWARD)} TON)`);
   }
   let tail = '';
-  if (!admin) {
+  if (!direct) {
     const u = await env.DB.prepare('SELECT balance FROM users WHERE id=?').bind(m.from.id).first();
     tail = `\n\n💰 Баланс: ${ton(u.balance)} TON`;
   }
@@ -266,7 +268,7 @@ const mainText = (u, admin) =>
   `👋 Бот-парсер NFT-подарков\n\n🎁 Бесплатных запросов: ${admin ? '∞' : u.free}\n💰 Баланс: ${ton(u.balance)} TON\n\nКаждый следующий запрос — 0.1 TON.\nПауза между запросами 10 сек, не больше ${DAILY_LIMIT} человек в сутки.`;
 const depositText = (env, u) =>
   `💰 Баланс: ${ton(u.balance)} TON\n\nПополнение (от 1 TON). Отправь TON на адрес:\n<code>${env.WALLET}</code>\n\n⚠️ В комментарии обязательно укажи свой ID:\n<code>${u.id}</code>\n\nЗачислится автоматически за 1–2 минуты.`;
-const earnText = `💸 Заработай TON на баланс\n\nНашёл NFT-подарок и его владельца? Пришли мне сообщением ссылку на NFT и @юзернейм владельца.\n\nПример:\nhttps://t.me/nft/PlushPepe-1 @username\n\nМожно несколько пар — каждую с новой строки (до 5 за раз).\n\n💰 За каждую принятую пару: +${ton(REWARD)} TON на баланс (до ${EARN_DAILY} в сутки).\n\nПара принимается, если NFT существует, @юзернейм настоящий, имя владельца на странице NFT совпадает с именем в профиле @юзернейма и такого NFT ещё нет в базе.`;
+const earnText = `💸 Заработай TON на баланс\n\nНашёл NFT-подарок и его владельца? Пришли мне сообщением ссылку на NFT и @юзернейм владельца.\n\nПример:\nhttps://t.me/nft/PlushPepe-1 @username\n\nМожно несколько пар — каждую с новой строки (до 5 за раз).\n\n💰 За каждую принятую пару: +${ton(REWARD)} TON на баланс (до ${EARN_DAILY} в сутки).\n\nПара принимается, если NFT существует, @юзернейм настоящий, имя владельца на странице NFT совпадает с именем в профиле @юзернейма. Один и тот же NFT и один и тот же человек засчитываются только один раз: если уже есть в базе, награды не будет.`;
 
 // ---------- обработчики ----------
 async function onMessage(m, env) {
@@ -277,6 +279,9 @@ async function onMessage(m, env) {
   const [cmd, a, b] = parts;
   const user = await getUser(env, m.from);
 
+  if (cmd === '/earn') { // сдача пары как обычный пользователь (проверка, дубли, награда) — работает и у админа
+    return handleSubmit(m, env, false, (m.text || '').replace(/^\/earn\S*\s*/i, ''));
+  }
   if (admin && m.forward_origin) { // пересланное сообщение из чата продаж
     const o = m.forward_origin;
     if (o.type === 'hidden_user') return send(env, m.chat.id, '❌ Автор скрыл пересылку — юзернейм взять негде.');
@@ -284,6 +289,10 @@ async function onMessage(m, env) {
     const rep = [];
     const n = await collect(m, env, o.sender_user, rep);
     return send(env, m.chat.id, `${n ? '✅ Добавлено: ' + n : '❌ Не добавлено'}\n${rep.join('\n')}`.slice(0, 3900));
+  }
+  if (admin && cmd === '/delnft') { // удалить запись из базы: /delnft PlushPepe-1
+    const r = await env.DB.prepare('DELETE FROM items WHERE lower(slug)=lower(?)').bind(a || '').run();
+    return send(env, m.chat.id, r.meta.changes ? '✅ Удалено из базы.' : 'Такого NFT в базе нет.');
   }
   if (admin && cmd === '/addchannel') { // /addchannel prodazhai  (можно несколько через пробел или ссылки)
     const names = parts.slice(1).map(x => x.replace(/^.*t\.me\/(s\/)?/i, '').replace(/^@/, '').split(/[/?]/)[0]).filter(Boolean);
@@ -333,7 +342,7 @@ async function onMessage(m, env) {
     return send(env, id, `✅ Баланс пополнен на ${t} TON`);
   }
   if (cmd === '/start') return send(env, m.chat.id, mainText(user, admin), { reply_markup: mainKb });
-  if (m.text && !m.text.startsWith('/') && /t\.me\/nft\//i.test(m.text)) return handleSubmit(m, env, admin);
+  if (m.text && !m.text.startsWith('/') && /t\.me\/nft\//i.test(m.text)) return handleSubmit(m, env, admin, m.text);
 }
 
 async function onCallback(q, env) {
